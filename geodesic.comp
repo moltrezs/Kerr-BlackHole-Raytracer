@@ -1,0 +1,280 @@
+#version 430
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba8) writeonly uniform image2D outImage;
+
+layout(std140, binding = 1) uniform Camera {
+    vec3 camPos;     float _pad0;
+    vec3 camRight;   float _pad1;
+    vec3 camUp;      float _pad2;
+    vec3 camForward; float _pad3;
+    float tanHalfFov;
+    float aspect;
+    bool moving;
+    int   _pad4;
+} cam;
+
+layout(std140, binding = 2) uniform Disk {
+    float disk_r1;
+    float disk_r2;
+    float disk_num;
+    float thickness;
+    float spin_a;
+};
+
+layout(std140, binding = 3) uniform Objects {
+    int numObjects;
+    vec4 objPosRadius[16];
+    vec4 objColor[16];
+    float mass[16];
+};
+
+const float SagA_rs = 1.269e10;
+const float M_GEOM  = 0.5 * SagA_rs;
+
+vec4 objectColor = vec4(0.0);
+vec3 hitCenter   = vec3(0.0);
+
+struct Ray {
+    vec3 pos;
+    vec3 mom;
+    float r;
+    float E;
+    float L;
+};
+
+// Cálculo exacto de la órbita circular estable más interna (ISCO) en unidades de M
+float computeKerrISCO(float a) {
+    float a2 = clamp(a * a, 0.0, 0.999);
+    float cbrt_1_minus_a2 = pow(1.0 - a2, 1.0 / 3.0);
+    float cbrt_1_plus_a   = pow(1.0 + a, 1.0 / 3.0);
+    float cbrt_1_minus_a  = pow(1.0 - a, 1.0 / 3.0);
+
+    float Z1 = 1.0 + cbrt_1_minus_a2 * (cbrt_1_plus_a + cbrt_1_minus_a);
+    float Z2 = sqrt(3.0 * a2 + Z1 * Z1);
+    float sgn = (a >= 0.0) ? 1.0 : -1.0;
+
+    return 3.0 + Z2 - sgn * sqrt(max((3.0 - Z1) * (3.0 + Z1 + 2.0 * Z2), 0.0));
+}
+
+Ray initRay(vec3 posMeters, vec3 dir) {
+    Ray ray;
+    ray.pos = posMeters / M_GEOM;
+    ray.r   = length(ray.pos);
+
+    float a = clamp(spin_a, -0.99, 0.99);
+    float r0 = ray.r;
+    float r2 = r0 * r0;
+    float Delta0 = max(r2 - 2.0 * r0 + a * a, 1e-4);
+
+    vec3 rHat = ray.pos / r0;
+    float dr  = dot(dir, rHat);
+    vec3 dPerp = dir - dr * rHat;
+
+    float pr = (r2 / Delta0) * dr;
+    ray.mom  = dPerp + pr * rHat;
+
+    ray.L = ray.pos.x * ray.mom.z - ray.pos.z * ray.mom.x;
+
+    float T0 = Delta0 * pr * pr + r2 * dot(dPerp, dPerp);
+    float rho2_xz = ray.pos.x * ray.pos.x + ray.pos.z * ray.pos.z;
+    float Aq = (r2 + a * a) * (r2 + a * a) + a * a * Delta0 * (rho2_xz / r2);
+    float Bq = a * ray.L * (r2 + a * a + Delta0);
+    float Cq = a * a * ray.L * ray.L - Delta0 * T0;
+
+    ray.E = (Bq + sqrt(max(Bq * Bq - Aq * Cq, 0.0))) / Aq;
+    return ray;
+}
+
+void geodesicRHS(Ray ray, out vec3 d_pos, out vec3 d_mom) {
+    float a  = clamp(spin_a, -0.99, 0.99);
+    float r2 = dot(ray.pos, ray.pos);
+    float r  = sqrt(r2);
+    vec3 rHat = ray.pos / max(r, 1e-4);
+
+    float pr = dot(rHat, ray.mom);
+    float p2 = dot(ray.mom, ray.mom);
+    float L  = ray.pos.x * ray.mom.z - ray.pos.z * ray.mom.x;
+
+    float Delta = max(r2 - 2.0 * r + a * a, 1e-4);
+    float W     = (r2 + a * a) * ray.E - a * L;
+
+    vec3 m = vec3(-ray.pos.z, 0.0, ray.pos.x);
+    float dG_dL = a * ray.E + (a * W) / Delta;
+
+    d_pos = ray.mom - ((2.0 * r - a * a) * pr / r2) * rHat + (dG_dL / r2) * m;
+
+    vec3 term1 = (r * p2) * rHat;
+    vec3 term2 = -(pr * pr) * rHat - ((2.0 * r - a * a) * pr / r) * (ray.mom - pr * rHat);
+    vec3 term3 = (a * a * ray.E * ray.E) * (vec3(0.0, ray.pos.y / r2, 0.0) - ((ray.pos.y * ray.pos.y) / (r2 * r)) * rHat);
+
+    float dG_dr = -(2.0 * r * ray.E * W) / Delta + ((r - 1.0) * W * W) / (Delta * Delta);
+    vec3 dL_dx  = vec3(ray.mom.z, 0.0, -ray.mom.x);
+    vec3 term4  = dG_dr * rHat + dG_dL * dL_dx;
+
+    d_mom = -(term1 + term2 + term3 + term4) / r2;
+}
+
+void rk4Step(inout Ray ray, float dL) {
+    vec3 dp1, dm1, dp2, dm2, dp3, dm3, dp4, dm4;
+
+    geodesicRHS(ray, dp1, dm1);
+
+    Ray r2 = ray;
+    r2.pos = ray.pos + 0.5 * dL * dp1;
+    r2.mom = ray.mom + 0.5 * dL * dm1;
+    geodesicRHS(r2, dp2, dm2);
+
+    Ray r3 = ray;
+    r3.pos = ray.pos + 0.5 * dL * dp2;
+    r3.mom = ray.mom + 0.5 * dL * dm2;
+    geodesicRHS(r3, dp3, dm3);
+
+    Ray r4 = ray;
+    r4.pos = ray.pos + dL * dp3;
+    r4.mom = ray.mom + dL * dm3;
+    geodesicRHS(r4, dp4, dm4);
+
+    ray.pos += (dL / 6.0) * (dp1 + 2.0 * dp2 + 2.0 * dp3 + dp4);
+    ray.mom += (dL / 6.0) * (dm1 + 2.0 * dm2 + 2.0 * dm3 + dm4);
+    ray.r    = length(ray.pos);
+}
+
+bool interceptObject(vec3 posMeters) {
+    for (int i = 0; i < numObjects; ++i) {
+        if (i == numObjects - 1) continue;
+        vec3 center  = objPosRadius[i].xyz;
+        float radius = objPosRadius[i].w;
+        if (distance(posMeters, center) <= radius) {
+            objectColor = objColor[i];
+            hitCenter   = center;
+            return true;
+        }
+    }
+    return false;
+}
+
+void main() {
+    ivec2 dims = imageSize(outImage);
+    ivec2 pix  = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= dims.x || pix.y >= dims.y) return;
+
+    float u = (2.0 * (pix.x + 0.5) / float(dims.x) - 1.0) * cam.aspect * cam.tanHalfFov;
+    float v = (1.0 - 2.0 * (pix.y + 0.5) / float(dims.y)) * cam.tanHalfFov;
+    vec3 dir = normalize(u * cam.camRight - v * cam.camUp + cam.camForward);
+
+    Ray ray = initRay(cam.camPos, dir);
+
+    float a = clamp(spin_a, -0.99, 0.99);
+    float r_plus   = 1.0 + sqrt(max(1.0 - a * a, 0.0));
+    float r_isco_M = computeKerrISCO(a);
+    float r_in     = r_isco_M * M_GEOM; // Borde interno gobernado por la ISCO de Kerr
+    float escape_r = 120.0;
+
+    vec3 prevPosMeters = ray.pos * M_GEOM;
+    bool hitBlackHole  = false;
+    bool hitDisk       = false;
+    bool hitObject     = false;
+    bool escaped       = false;
+
+    vec3 accumulatedColor  = vec3(0.0);
+    float accumulatedAlpha = 0.0;
+    int crossings          = 0;
+
+    int steps = cam.moving ? 500 : 1200;
+
+    for (int i = 0; i < steps; ++i) {
+        if (ray.r <= r_plus * 1.02) {
+            hitBlackHole = true;
+            break;
+        }
+
+        float dL = clamp(0.04 * (ray.r - r_plus * 0.8), 0.015, 0.6);
+        rk4Step(ray, dL);
+
+        vec3 newPosMeters = ray.pos * M_GEOM;
+
+        if (prevPosMeters.y * newPosMeters.y < 0.0) {
+            float y_sum  = abs(prevPosMeters.y) + abs(newPosMeters.y);
+            float frac   = (y_sum > 0.0) ? (abs(prevPosMeters.y) / y_sum) : 0.5;
+            vec3 hitPos  = mix(prevPosMeters, newPosMeters, frac);
+            float r_phys = length(vec2(hitPos.x, hitPos.z));
+
+            if (r_phys >= r_in && r_phys <= disk_r2) {
+                float r_norm = max(r_phys / r_in, 1.0001);
+                float T_emit = pow(r_norm, -0.75) * pow(max(1.0 - sqrt(1.0 / r_norm), 0.001), 0.25) * 1.45;
+
+                vec3 gasDir   = normalize(vec3(-hitPos.z, 0.0, hitPos.x));
+                vec3 toCamera = normalize(prevPosMeters - newPosMeters);
+
+                // Velocidad orbital relativista de Kerr en el plano ecuatorial
+                float r_M   = r_phys / M_GEOM;
+                float v_orb = clamp(1.0 / sqrt(max(r_M - 2.0 + a / sqrt(r_M), 1.1)), 0.0, 0.94);
+                float v_los = v_orb * dot(gasDir, toCamera);
+
+                float grav_redshift = sqrt(clamp(1.0 - (2.0 / r_M), 0.05, 1.0));
+                float g = sqrt(max((1.0 + v_los) / max(1.0 - v_los, 0.001), 0.01)) * grav_redshift;
+
+                float T_obs = T_emit * g;
+                vec3 blackbodyColor = vec3(
+                    clamp(T_obs * 1.8, 0.0, 1.0),
+                    clamp(pow(T_obs, 2.0) * 1.15, 0.0, 1.0),
+                    clamp(pow(T_obs, 3.5) * 1.4, 0.0, 1.0)
+                );
+
+                float edgeFade  = clamp((disk_r2 - r_phys) / (disk_r2 - r_in), 0.0, 1.0);
+                float intensity = pow(g, 3.0) * T_emit * 1.5;
+                vec3 layerColor = clamp(blackbodyColor * intensity, 0.0, 1.0);
+
+                float attenuation = (crossings == 0) ? 1.0 : 0.45 / float(crossings);
+                accumulatedColor += layerColor * attenuation * (1.0 - accumulatedAlpha);
+                accumulatedAlpha += edgeFade * attenuation;
+
+                crossings++;
+                if (crossings >= 3 || accumulatedAlpha >= 0.95) {
+                    hitDisk = true;
+                    break;
+                }
+            }
+        }
+
+        if (interceptObject(newPosMeters)) {
+            hitObject = true;
+            break;
+        }
+
+        prevPosMeters = newPosMeters;
+        if (ray.r > escape_r) {
+            escaped = true;
+            break;
+        }
+    }
+
+    vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
+
+    if (crossings > 0) {
+        vec3 bg = vec3(0.0);
+        if (escaped && !hitBlackHole) {
+            vec3 starDir   = normalize(ray.mom);
+            float starHash = fract(sin(dot(floor(starDir * 250.0), vec3(12.9898, 78.233, 45.164))) * 43758.5453);
+            bg = vec3(smoothstep(0.985, 0.999, starHash) * 0.6);
+        }
+        float alpha = clamp(accumulatedAlpha, 0.0, 1.0);
+        color = vec4(accumulatedColor + bg * (1.0 - alpha), 1.0);
+    } else if (hitBlackHole) {
+        color = vec4(0.0, 0.0, 0.0, 1.0);
+    } else if (hitObject) {
+        vec3 P = ray.pos * M_GEOM;
+        vec3 N = normalize(P - hitCenter);
+        vec3 V = normalize(cam.camPos - P);
+        float diff = max(dot(N, V), 0.0);
+        color = vec4(objectColor.rgb * (0.15 + 0.85 * diff), 1.0);
+    } else if (escaped) {
+        vec3 starDir   = normalize(ray.mom);
+        float starHash = fract(sin(dot(floor(starDir * 250.0), vec3(12.9898, 78.233, 45.164))) * 43758.5453);
+        float stars    = smoothstep(0.985, 0.999, starHash) * 0.6;
+        color = vec4(vec3(stars), 1.0);
+    }
+
+    imageStore(outImage, pix, color);
+}
